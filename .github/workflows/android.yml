@@ -1,0 +1,86 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    env:
+      VERSION_NAME: 0.1.${{ github.run_number }}
+      VERSION_CODE: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck, tests, formatting
+        run: npm run check
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Generate app icons
+        run: npx capacitor-assets generate --android --iconBackgroundColor '#0a0a0a' --iconBackgroundColorDark '#0a0a0a' --splashBackgroundColor '#f5f5f5' --splashBackgroundColorDark '#0a0a0a'
+
+      - name: Decode signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Secret ANDROID_KEYSTORE_B64 is missing, release APK cannot be signed"
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/subshelf.p12"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/subshelf.p12" >> "$GITHUB_ENV"
+
+      - name: Build signed APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: cp android/app/build/outputs/apk/release/app-release.apk "SubShelf-$VERSION_NAME.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SubShelf-${{ env.VERSION_NAME }}
+          path: SubShelf-*.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION_NAME }}
+          name: SubShelf ${{ env.VERSION_NAME }}
+          target_commitish: ${{ github.sha }}
+          files: SubShelf-*.apk
+          make_latest: true
+          body: |
+            Скачайте `SubShelf-${{ env.VERSION_NAME }}.apk` на телефон и установите.
+            Обновление ставится поверх прошлой версии, данные сохраняются.

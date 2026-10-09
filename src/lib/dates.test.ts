@@ -3,6 +3,8 @@ import {
   addCycleN,
   daysUntil,
   isValidYmd,
+  mainCurrency,
+  monthlyByCurrency,
   monthlyCost,
   nextCharge,
   upcomingCharges,
@@ -16,11 +18,11 @@ const sub = (over: Partial<Sub>): Sub => ({
   price: 10,
   currency: 'USD',
   cycle: 'monthly',
-  startDate: null,
-  chargeDate: '2026-10-01',
-  cancelUrl: null,
+  nextDate: '2026-10-01',
+  remind: 1,
+  icon: { kind: 'monogram' },
   notes: null,
-  cancelledAt: null,
+  archivedAt: null,
   createdAt: 0,
   ...over,
 })
@@ -50,22 +52,37 @@ describe('dates', () => {
   })
 
   it('reports trials as overdue once the date passed', () => {
-    const t = sub({ status: 'trial', chargeDate: '2026-10-10' })
+    const t = sub({ status: 'trial', nextDate: '2026-10-10' })
     expect(nextCharge(t, '2026-10-08')).toEqual({ date: '2026-10-10', overdue: false })
     expect(nextCharge(t, '2026-10-12')).toEqual({ date: '2026-10-10', overdue: true })
     expect(upcomingCharges(t, '2026-10-12', 2)).toEqual([])
   })
 
-  it('never charges cancelled subscriptions', () => {
-    expect(nextCharge(sub({ status: 'cancelled' }), '2026-10-08')).toBeNull()
+  it('never charges archived subscriptions', () => {
+    expect(nextCharge(sub({ archivedAt: '2026-10-02' }), '2026-10-08')).toBeNull()
+    expect(upcomingCharges(sub({ archivedAt: '2026-10-02' }), '2026-10-08', 2)).toEqual([])
   })
 
   it('lists several upcoming charges for reminders', () => {
     expect(upcomingCharges(sub({}), '2026-10-08', 2)).toEqual(['2026-11-01', '2026-12-01'])
   })
 
-  it('normalises prices to a month', () => {
+  it('normalises prices to a month and groups by currency', () => {
     expect(monthlyCost(sub({ cycle: 'yearly', price: 120 }))).toBe(10)
     expect(monthlyCost(sub({ price: null }))).toBe(0)
+    const totals = monthlyByCurrency(
+      [sub({ price: 5 }), sub({ price: 649, currency: 'RUB' }), sub({ price: 3 })],
+      () => true,
+    )
+    expect(totals.get('USD')).toBe(8)
+    expect(mainCurrency(totals)).toBe('USD')
+    expect(
+      mainCurrency(
+        new Map([
+          ['RUB', 649],
+          ['EUR', 5],
+        ]),
+      ),
+    ).toBe('RUB')
   })
 })

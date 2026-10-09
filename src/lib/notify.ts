@@ -4,8 +4,6 @@ import { addDays, fmtDate, fmtMoney, localYmd, upcomingCharges, type Sub } from 
 import type { I18n } from './i18n'
 
 const CHANNEL = 'charges'
-/** Reminder offsets in days before a charge. Index is part of the notification id. */
-const OFFSETS = [-3, -1, 0] as const
 /** How many future charges of an active subscription get reminders, so they fire even if the app stays closed. */
 const OCCURRENCES = 2
 
@@ -40,27 +38,34 @@ function atLocal(ymd: string, hour: number): Date {
   return new Date(y, m - 1, d, hour, 0, 0, 0)
 }
 
+/** One reminder `remind` days before each upcoming charge plus one on the day itself. */
 export function buildReminders(subs: Sub[], i18n: I18n, hour: number, now = new Date()) {
   const today = localYmd(now)
   const list: LocalNotificationSchema[] = []
   for (const s of subs) {
-    upcomingCharges(s, today, OCCURRENCES).forEach((date, occ) => {
-      OFFSETS.forEach((offset, k) => {
+    if (s.remind === null) continue
+    const offsets = s.remind === 0 ? [0] : [-s.remind, 0]
+    upcomingCharges(s, today, s.status === 'trial' ? 1 : OCCURRENCES).forEach((date, occ) => {
+      offsets.forEach((offset, k) => {
         const at = atLocal(addDays(date, offset), hour)
         if (at.getTime() <= now.getTime()) return
-        const price =
-          s.price != null
-            ? i18n.t('nPrice', { price: fmtMoney(s.price, s.currency, i18n.locale) })
-            : ''
-        const title = i18n.t(offset === -3 ? 'n3Title' : offset === -1 ? 'n1Title' : 'n0Title', {
-          name: s.name,
-        })
-        const body = i18n.t(s.status === 'trial' ? 'nBodyTrial' : 'nBodyActive', {
-          date: fmtDate(date, i18n.locale),
-          price,
+        const price = s.price != null ? fmtMoney(s.price, s.currency, i18n.locale) : ''
+        const when =
+          offset === 0
+            ? i18n.t('whenToday')
+            : offset === -1
+              ? i18n.t('whenTomorrow')
+              : i18n.t('whenIn', { n: -offset })
+        const title =
+          s.status === 'trial'
+            ? i18n.t('nTrialTitle', { name: s.name, when })
+            : i18n.t('nActiveTitle', { name: s.name, when })
+        const body = i18n.t(s.status === 'trial' ? 'nTrialBody' : 'nActiveBody', {
+          date: fmtDate(date, i18n.locale, true),
+          price: price || '—',
         })
         list.push({
-          id: s.id * 10 + occ * OFFSETS.length + k,
+          id: s.id * 10 + occ * 2 + k,
           title,
           body,
           channelId: CHANNEL,

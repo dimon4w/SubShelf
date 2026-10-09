@@ -1,24 +1,45 @@
-import { useState, type ReactNode } from 'react'
-import { addDays, type Cycle, type Status, type Sub } from '@/lib/dates'
-import { normalizeUrl } from '@/lib/store'
-import { useI18n } from '@/lib/i18n'
-import { Segmented } from './Segmented'
+import { useEffect, useRef, useState } from 'react'
+import { ChevronRight, StickyNote } from 'lucide-react'
+import { searchCatalog, norm, type CatalogEntry } from '@/lib/catalog'
+import {
+  fmtDate,
+  REMIND_OPTIONS,
+  type Cycle,
+  type RemindDays,
+  type Status,
+  type Sub,
+  type SubIcon,
+} from '@/lib/dates'
+import { resolveIcon } from '@/lib/icons'
+import { useI18n, type Key } from '@/lib/i18n'
+import { cn } from '@/lib/cn'
+import { CalendarSheet } from './Calendar'
+import { Fit } from './Fit'
+import { ServiceIcon } from './ServiceIcon'
+import { ChoiceSheet, Sheet } from './Sheet'
+import { Segmented, relWord } from './SubRow'
 
 const CURRENCIES = ['USD', 'EUR', 'MDL', 'RUB', 'UAH', 'RON', 'GBP', 'THB']
+const CYCLES: Cycle[] = ['weekly', 'monthly', 'yearly']
 
-export interface Draft {
+export type SubFields = Omit<Sub, 'id' | 'createdAt' | 'archivedAt'>
+
+interface Draft {
   name: string
   status: Status
   price: string
   currency: string
   cycle: Cycle
-  startDate: string
-  chargeDate: string
-  cancelUrl: string
+  nextDate: string | null
+  remind: RemindDays
+  icon: SubIcon
   notes: string
 }
 
-export function draftFrom(s: Sub | null, today: string): Draft {
+export const remindKey = (r: RemindDays, short = false): Key =>
+  `${short ? 'remindShort' : 'remind'}${r === null ? 'Off' : r}` as Key
+
+function draftFrom(s: Sub | null, defaultRemind: RemindDays, restore: boolean): Draft {
   if (!s) {
     return {
       name: '',
@@ -26,220 +47,362 @@ export function draftFrom(s: Sub | null, today: string): Draft {
       price: '',
       currency: 'USD',
       cycle: 'monthly',
-      startDate: today,
-      chargeDate: '',
-      cancelUrl: '',
+      nextDate: null,
+      remind: defaultRemind,
+      icon: { kind: 'monogram' },
       notes: '',
     }
   }
   return {
     name: s.name,
     status: s.status,
-    price: s.price == null ? '' : String(s.price),
+    price: s.price == null ? '' : String(s.price).replace('.', ','),
     currency: s.currency,
     cycle: s.cycle,
-    startDate: s.startDate ?? '',
-    chargeDate: s.chargeDate ?? '',
-    cancelUrl: s.cancelUrl ?? '',
+    nextDate: restore ? null : s.nextDate,
+    remind: s.remind,
+    icon: s.icon,
     notes: s.notes ?? '',
   }
 }
 
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label className="block">
-      <span className="mb-1.5 block text-sm font-medium text-fg-2">{label}</span>
-      {children}
-    </label>
-  )
-}
+type Picker = 'currency' | 'cycle' | 'remind' | 'date' | 'icon' | null
 
 export function SubForm({
-  initial,
+  open,
+  sub,
+  restore,
   today,
-  isEdit,
+  online,
+  defaultRemind,
   onSave,
-  onDelete,
+  onClose,
 }: {
-  initial: Draft
+  open: boolean
+  sub: Sub | null
+  restore: boolean
   today: string
-  isEdit: boolean
-  onSave: (fields: Omit<Sub, 'id' | 'createdAt' | 'cancelledAt'>) => void
-  onDelete?: () => void
+  online: boolean
+  defaultRemind: RemindDays
+  onSave: (fields: SubFields) => void
+  onClose: () => void
 }) {
-  const { t } = useI18n()
-  const [d, setD] = useState<Draft>(initial)
+  const i18n = useI18n()
+  const { t, locale } = i18n
+  const [d, setD] = useState<Draft>(() => draftFrom(sub, defaultRemind, restore))
+  const [noteOpen, setNoteOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const set = <K extends keyof Draft>(k: K, v: Draft[K]) => setD((prev) => ({ ...prev, [k]: v }))
+  const [picker, setPicker] = useState<Picker>(null)
+  const [suggest, setSuggest] = useState<CatalogEntry[]>([])
+  const [searching, setSearching] = useState(false)
+  const nameRef = useRef<HTMLInputElement>(null)
+  const seq = useRef(0)
+
+  useEffect(() => {
+    if (!open) return
+    setD(draftFrom(sub, defaultRemind, restore))
+    setNoteOpen(Boolean(sub?.notes))
+    setError(null)
+    setSuggest([])
+    setSearching(false)
+    setPicker(null)
+  }, [open, sub, defaultRemind, restore])
+
+  const set = <K extends keyof Draft>(k: K, v: Draft[K]) => setD((p) => ({ ...p, [k]: v }))
+
+  /** Icon follows the name: catalog instantly, online guess after a pause. */
+  useEffect(() => {
+    if (!open) return
+    const q = d.name.trim()
+    const my = ++seq.current
+    const hits = searchCatalog(q, 3)
+    const exact = hits.find((c) => norm(c.name) === norm(q) || c.aliases.includes(norm(q)))
+    setSuggest(exact ? [] : hits)
+    if (exact || hits.length === 1) {
+      const c = exact ?? hits[0]
+      setD((p) =>
+        p.icon.domain === c.domain ? p : { ...p, icon: { kind: 'catalog', domain: c.domain } },
+      )
+      setSearching(false)
+      return
+    }
+    if (q.length < 2 || hits.length > 0 || !online) {
+      setSearching(false)
+      if (d.icon.kind !== 'monogram' && sub?.name !== d.name)
+        setD((p) => ({ ...p, icon: { kind: 'monogram' } }))
+      return
+    }
+    setSearching(true)
+    const tm = window.setTimeout(() => {
+      void resolveIcon(q, true).then((icon) => {
+        if (seq.current !== my) return
+        setSearching(false)
+        setD((p) => ({ ...p, icon }))
+      })
+    }, 450)
+    return () => window.clearTimeout(tm)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [d.name, open, online])
+
+  const pick = (c: CatalogEntry) => {
+    setD((p) => ({ ...p, name: c.name, icon: { kind: 'catalog', domain: c.domain } }))
+    setSuggest([])
+  }
 
   const submit = () => {
     const name = d.name.trim()
     if (!name) return setError(t('errName'))
-    const priceRaw = d.price.trim().replace(',', '.')
-    const price = priceRaw === '' ? null : Number(priceRaw)
+    const raw = d.price.trim().replace(',', '.')
+    const price = raw === '' ? null : Number(raw)
     if (price !== null && (!Number.isFinite(price) || price < 0)) return setError(t('errPrice'))
-    const cancelUrl = normalizeUrl(d.cancelUrl)
-    if (d.cancelUrl.trim() && !cancelUrl) return setError(t('errUrl'))
     onSave({
       name: name.slice(0, 80),
       status: d.status,
       price,
       currency: d.currency,
       cycle: d.cycle,
-      startDate: d.startDate || null,
-      chargeDate: d.chargeDate || null,
-      cancelUrl,
-      notes: d.notes.trim() || null,
+      nextDate: d.nextDate,
+      remind: d.remind,
+      icon: d.icon,
+      notes: d.notes.trim() ? d.notes.trim().slice(0, 500) : null,
     })
   }
 
-  const chargeLabel =
-    d.status === 'trial'
-      ? t('fChargeTrial')
-      : d.status === 'active'
-        ? t('fChargeActive')
-        : t('fChargeCancelled')
+  const trial = d.status === 'trial'
+  const dateValues = d.nextDate
+    ? [
+        `${fmtDate(d.nextDate, locale)} · ${relWord(d.nextDate, today, i18n)}`,
+        fmtDate(d.nextDate, locale),
+      ]
+    : [t('pick')]
+  const title = restore ? t('formRestore') : sub ? t('formEdit') : t('formNew')
 
   return (
-    <form
-      className="flex flex-col gap-4"
-      onSubmit={(e) => {
-        e.preventDefault()
-        submit()
-      }}
-    >
-      <Field label={t('fName')}>
-        <input
-          className="input"
-          value={d.name}
-          onChange={(e) => set('name', e.target.value)}
-          placeholder={t('fNamePh')}
-          maxLength={80}
-          autoFocus={!isEdit}
-        />
-      </Field>
-
-      <div>
-        <span className="mb-1.5 block text-sm font-medium text-fg-2">{t('fStatus')}</span>
-        <Segmented<Status>
-          label={t('fStatus')}
-          stretch
-          value={d.status}
-          onChange={(v) => set('status', v)}
-          options={[
-            { value: 'trial', label: t('statusTrial') },
-            { value: 'active', label: t('statusActive') },
-            { value: 'cancelled', label: t('statusCancelled') },
-          ]}
-        />
-      </div>
-
-      <div className="grid grid-cols-[1.4fr_1fr] gap-3">
-        <Field label={d.status === 'trial' ? t('fPriceTrial') : t('fPrice')}>
-          <input
-            className="input tabular"
-            value={d.price}
-            onChange={(e) => set('price', e.target.value)}
-            inputMode="decimal"
-            placeholder="9.99"
-          />
-        </Field>
-        <Field label={t('fCurrency')}>
-          <select
-            className="input"
-            value={d.currency}
-            onChange={(e) => set('currency', e.target.value)}
-          >
-            {(CURRENCIES.includes(d.currency) ? CURRENCIES : [d.currency, ...CURRENCIES]).map(
-              (c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ),
-            )}
-          </select>
-        </Field>
-      </div>
-
-      <Field label={t('fCycle')}>
-        <select
-          className="input"
-          value={d.cycle}
-          onChange={(e) => set('cycle', e.target.value as Cycle)}
-        >
-          <option value="weekly">{t('cycleweekly')}</option>
-          <option value="monthly">{t('cyclemonthly')}</option>
-          <option value="yearly">{t('cycleyearly')}</option>
-        </select>
-      </Field>
-
-      <div className="grid grid-cols-2 gap-3">
-        <Field label={t('fStart')}>
-          <input
-            className="input tabular"
-            type="date"
-            value={d.startDate}
-            onChange={(e) => set('startDate', e.target.value)}
-          />
-        </Field>
-        <Field label={chargeLabel}>
-          <input
-            className="input tabular"
-            type="date"
-            value={d.chargeDate}
-            onChange={(e) => set('chargeDate', e.target.value)}
-          />
-        </Field>
-      </div>
-
-      {d.status === 'trial' ? (
-        <div className="-mt-1 flex flex-wrap gap-2">
-          {[7, 14, 30].map((n) => (
-            <button
-              key={n}
-              type="button"
-              className="pill-btn"
-              onClick={() => set('chargeDate', addDays(d.startDate || today, n))}
-            >
-              {t('quickDays', { n })}
-            </button>
-          ))}
-        </div>
-      ) : null}
-
-      <Field label={t('fCancelUrl')}>
-        <input
-          className="input"
-          value={d.cancelUrl}
-          onChange={(e) => set('cancelUrl', e.target.value)}
-          inputMode="url"
-          autoCapitalize="off"
-          placeholder="netflix.com/cancelplan"
-        />
-      </Field>
-
-      <Field label={t('fNotes')}>
-        <textarea
-          className="input min-h-20 py-2.5"
-          value={d.notes}
-          onChange={(e) => set('notes', e.target.value)}
-          maxLength={500}
-          rows={2}
-        />
-      </Field>
-
-      {error ? <p className="text-sm font-medium text-danger">{error}</p> : null}
-
-      <div className="flex gap-2.5 pt-1">
-        <button type="submit" className="btn-primary flex-1">
-          {t('save')}
-        </button>
-        {isEdit && onDelete ? (
-          <button type="button" className="btn-danger" onClick={onDelete}>
-            {t('delete')}
+    <>
+      <Sheet
+        open={open}
+        onClose={onClose}
+        full
+        label={title}
+        onOpened={() => {
+          if (!sub) nameRef.current?.focus({ preventScroll: true })
+        }}
+      >
+        <div className="sheet-head">
+          <button type="button" className="btn btn-ghost none" onClick={onClose}>
+            {t('cancel')}
           </button>
-        ) : null}
-      </div>
-    </form>
+          <span className="t-head line grow center">{title}</span>
+          <span className="none head-spacer" />
+        </div>
+
+        <div className="sheet-body">
+          <div className="namebox">
+            <button
+              type="button"
+              className="icon-pick none"
+              aria-label={t('iconTitle')}
+              onClick={() => setPicker('icon')}
+            >
+              <ServiceIcon
+                name={d.name || '?'}
+                icon={d.icon}
+                size={64}
+                online={online}
+                loading={searching}
+              />
+            </button>
+            <input
+              ref={nameRef}
+              className="name-input"
+              value={d.name}
+              placeholder={t('fName')}
+              aria-label={t('fName')}
+              maxLength={80}
+              autoComplete="off"
+              autoCapitalize="words"
+              enterKeyHint="done"
+              onChange={(e) => {
+                set('name', e.target.value)
+                setError(null)
+              }}
+            />
+          </div>
+
+          {suggest.length > 0 ? (
+            <div className="group sugg">
+              {suggest.map((c) => (
+                <button key={c.name} type="button" className="row row-sugg" onClick={() => pick(c)}>
+                  <ServiceIcon
+                    name={c.name}
+                    icon={{ kind: 'catalog', domain: c.domain }}
+                    size={32}
+                    online={online}
+                  />
+                  <span className="col grow">
+                    <span className="t-body line">{c.name}</span>
+                    <span className="t-cap c3 line">{c.domain}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : searching ? (
+            <div className="t-sub c3 line sugg-note">{t('searching')}</div>
+          ) : null}
+
+          <Segmented<Status>
+            label={t('statusTrial')}
+            value={d.status}
+            onChange={(v) => set('status', v)}
+            options={[
+              { value: 'trial', label: t('statusTrial') },
+              { value: 'active', label: t('statusActive') },
+            ]}
+          />
+
+          <div className="group">
+            <div className="row row-form row-plain no-press">
+              <span className="t-body line grow">{trial ? t('fPriceTrial') : t('fPrice')}</span>
+              <input
+                className="price-input none"
+                value={d.price}
+                inputMode="decimal"
+                placeholder="0"
+                aria-label={t('fPrice')}
+                onChange={(e) => {
+                  set('price', e.target.value)
+                  setError(null)
+                }}
+              />
+              <button type="button" className="cur-btn none" onClick={() => setPicker('currency')}>
+                {d.currency}
+              </button>
+            </div>
+            <FormRow
+              label={t('fCycle')}
+              values={[t(`cycle${d.cycle}`), t(`per${d.cycle}`)]}
+              onClick={() => setPicker('cycle')}
+            />
+            <FormRow
+              label={trial ? t('fDateTrial') : t('fDateActive')}
+              values={dateValues}
+              onClick={() => setPicker('date')}
+            />
+            <FormRow
+              label={t('fRemind')}
+              values={[t(remindKey(d.remind)), t(remindKey(d.remind, true))]}
+              onClick={() => setPicker('remind')}
+            />
+          </div>
+
+          <div className="group note-group">
+            {noteOpen ? (
+              <textarea
+                className="note multi"
+                value={d.notes}
+                maxLength={500}
+                placeholder={t('fNotePh')}
+                aria-label={t('fNote')}
+                rows={3}
+                onChange={(e) => set('notes', e.target.value)}
+              />
+            ) : (
+              <button
+                type="button"
+                className="row row-form row-plain"
+                onClick={() => setNoteOpen(true)}
+              >
+                <StickyNote size={20} className="c2 none" />
+                <span className="t-body line grow">{t('fNote')}</span>
+                <ChevronRight size={16} className="chev" />
+              </button>
+            )}
+          </div>
+
+          {error ? <div className="err t-sub line">{error}</div> : null}
+        </div>
+
+        <div className="sheet-foot">
+          <button type="button" className="btn btn-primary btn-wide" onClick={submit}>
+            {t('save')}
+          </button>
+        </div>
+      </Sheet>
+
+      <ChoiceSheet
+        open={picker === 'currency'}
+        title={t('currency')}
+        options={(CURRENCIES.includes(d.currency) ? CURRENCIES : [d.currency, ...CURRENCIES]).map(
+          (c) => ({ value: c, label: c }),
+        )}
+        value={d.currency}
+        onPick={(v) => set('currency', v)}
+        onClose={() => setPicker(null)}
+      />
+      <ChoiceSheet
+        open={picker === 'cycle'}
+        title={t('fCycle')}
+        options={CYCLES.map((c) => ({ value: c, label: t(`cycle${c}`) }))}
+        value={d.cycle}
+        onPick={(v) => set('cycle', v)}
+        onClose={() => setPicker(null)}
+      />
+      <ChoiceSheet
+        open={picker === 'remind'}
+        title={t('fRemind')}
+        options={REMIND_OPTIONS.map((r) => ({ value: r, label: t(remindKey(r)) }))}
+        value={d.remind}
+        onPick={(v) => set('remind', v)}
+        onClose={() => setPicker(null)}
+      />
+      <ChoiceSheet
+        open={picker === 'icon'}
+        title={t('iconTitle')}
+        options={[
+          { value: 'retry', label: t('iconRetry') },
+          { value: 'letter', label: t('iconLetter') },
+        ]}
+        value={undefined}
+        onPick={(v) => {
+          if (v === 'letter') set('icon', { kind: 'monogram' })
+          else {
+            setSearching(true)
+            void resolveIcon(d.name, online).then((icon) => {
+              setSearching(false)
+              set('icon', icon)
+            })
+          }
+        }}
+        onClose={() => setPicker(null)}
+      />
+      <CalendarSheet
+        open={picker === 'date'}
+        value={d.nextDate}
+        today={today}
+        trial={trial}
+        onPick={(v) => set('nextDate', v)}
+        onClose={() => setPicker(null)}
+      />
+    </>
+  )
+}
+
+export function FormRow({
+  label,
+  values,
+  onClick,
+  className,
+}: {
+  label: string
+  values: string[]
+  onClick: () => void
+  className?: string
+}) {
+  return (
+    <button type="button" className={cn('row row-form row-plain', className)} onClick={onClick}>
+      <span className="t-body line none label-col">{label}</span>
+      <Fit className="t-body c3 grow right" variants={values} />
+      <ChevronRight size={16} className="chev" />
+    </button>
   )
 }

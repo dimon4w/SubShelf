@@ -1,5 +1,17 @@
-export type Status = 'trial' | 'active' | 'cancelled'
+export type Status = 'trial' | 'active'
 export type Cycle = 'weekly' | 'monthly' | 'yearly'
+/** Days before the charge to remind; null = no reminder. */
+export type RemindDays = 0 | 1 | 3 | 7 | null
+
+export const REMIND_OPTIONS: RemindDays[] = [0, 1, 3, 7, null]
+
+export interface SubIcon {
+  kind: 'catalog' | 'remote' | 'monogram'
+  /** Service domain used to fetch the icon. */
+  domain?: string
+  /** Cached icon as a data URL, so the list never hits the network. */
+  data?: string
+}
 
 export interface Sub {
   id: number
@@ -9,12 +21,13 @@ export interface Sub {
   price: number | null
   currency: string
   cycle: Cycle
-  startDate: string | null
-  /** trial: day of the first charge. active: any known charge date (rolled forward). cancelled: access until. */
-  chargeDate: string | null
-  cancelUrl: string | null
+  /** trial: the day the trial ends (first charge). active: any known charge date, rolled forward. */
+  nextDate: string | null
+  remind: RemindDays
+  icon: SubIcon
   notes: string | null
-  cancelledAt: string | null
+  /** Set when the subscription was cancelled: from then on it lives in the history. */
+  archivedAt: string | null
   createdAt: number
 }
 
@@ -63,13 +76,13 @@ export function addCycleN(base: string, cycle: Cycle, n: number): string {
   return toYmd(new Date(Date.UTC(ny, nm, Math.min(d, dim))))
 }
 
-/** Upcoming charge dates (today or later), at most `count`. Overdue trials yield nothing. */
+/** Upcoming charge dates (today or later), at most `count`. Archived subs and overdue trials yield nothing. */
 export function upcomingCharges(s: Sub, today: string, count: number): string[] {
-  if (s.status === 'cancelled' || !s.chargeDate) return []
-  if (s.status === 'trial') return daysUntil(s.chargeDate, today) >= 0 ? [s.chargeDate] : []
+  if (s.archivedAt || !s.nextDate) return []
+  if (s.status === 'trial') return daysUntil(s.nextDate, today) >= 0 ? [s.nextDate] : []
   const out: string[] = []
   for (let n = 0; n < 5000 && out.length < count; n++) {
-    const date = addCycleN(s.chargeDate, s.cycle, n)
+    const date = addCycleN(s.nextDate, s.cycle, n)
     if (daysUntil(date, today) >= 0) out.push(date)
   }
   return out
@@ -82,9 +95,9 @@ export interface Next {
 
 /** Next charge, or null when nothing will be charged. A trial past its date is reported as overdue. */
 export function nextCharge(s: Sub, today: string): Next | null {
-  if (s.status === 'cancelled' || !s.chargeDate) return null
+  if (s.archivedAt || !s.nextDate) return null
   if (s.status === 'trial') {
-    return { date: s.chargeDate, overdue: daysUntil(s.chargeDate, today) < 0 }
+    return { date: s.nextDate, overdue: daysUntil(s.nextDate, today) < 0 }
   }
   const [date] = upcomingCharges(s, today, 1)
   return date ? { date, overdue: false } : null
@@ -92,26 +105,65 @@ export function nextCharge(s: Sub, today: string): Next | null {
 
 const MONTHLY: Record<Cycle, number> = { weekly: 52 / 12, monthly: 1, yearly: 1 / 12 }
 
-export function monthlyCost(s: Sub): number {
+export function monthlyCost(s: Pick<Sub, 'price' | 'cycle'>): number {
   return (s.price ?? 0) * MONTHLY[s.cycle]
 }
 
-export function fmtDate(ymd: string, locale: string): string {
+export function fmtDate(ymd: string, locale: string, long = false): string {
   return new Intl.DateTimeFormat(locale, {
     day: 'numeric',
-    month: 'short',
+    month: long ? 'long' : 'short',
     timeZone: 'UTC',
   }).format(parseYmd(ymd))
 }
 
-export function fmtMoney(amount: number, currency: string, locale: string): string {
+export function fmtMonthYear(ymd: string, locale: string): string {
+  const s = new Intl.DateTimeFormat(locale, { month: 'long', year: 'numeric', timeZone: 'UTC' })
+    .format(parseYmd(ymd))
+    .replace(/\s?г\.$/, '')
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+export function fmtMoney(
+  amount: number,
+  currency: string,
+  locale: string,
+  compact = false,
+): string {
   try {
     return new Intl.NumberFormat(locale, {
       style: 'currency',
       currency,
       maximumFractionDigits: Number.isInteger(amount) ? 0 : 2,
+      notation: compact ? 'compact' : 'standard',
     }).format(amount)
   } catch {
     return `${amount} ${currency}`
   }
 }
+
+/** Sum of monthly costs per currency. */
+export function monthlyByCurrency(subs: Sub[], filter: (s: Sub) => boolean): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const s of subs) {
+    if (!filter(s) || s.price == null) continue
+    out.set(s.currency, (out.get(s.currency) ?? 0) + monthlyCost(s))
+  }
+  return out
+}
+
+/** The currency shown big: USD when present, otherwise the largest total. */
+export function mainCurrency(totals: Map<string, number>): string {
+  if (totals.has('USD')) return 'USD'
+  let best = 'USD'
+  let max = -1
+  for (const [cur, v] of totals) {
+    if (v > max) {
+      best = cur
+      max = v
+    }
+  }
+  return best
+}
+
+export const round2 = (v: number) => Math.round(v * 100) / 100
